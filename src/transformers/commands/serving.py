@@ -11,19 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import base64
 import copy
 import functools
 import json
 import re
+import tempfile
 import time
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass, field
+from io import BytesIO
 from threading import Thread
-from typing import Generator, Optional
+from typing import Generator, Iterable, Optional, Union
 
 from huggingface_hub import ModelInfo, model_info
+from openai.types.chat import ChatCompletionMessageParam
+from PIL import Image
 
+import transformers
 from transformers.utils.import_utils import (
     is_fastapi_available,
     is_openai_available,
@@ -31,7 +36,7 @@ from transformers.utils.import_utils import (
     is_uvicorn_available,
 )
 
-from .. import LogitsProcessorList, PreTrainedTokenizerFast, TextIteratorStreamer
+from .. import AutoConfig, LogitsProcessorList, PreTrainedTokenizerFast, TextIteratorStreamer
 from ..generation.continuous_batching import ContinuousBatchingManager, RequestStatus
 from ..utils import is_torch_available, logging
 from . import BaseTransformersCLICommand
@@ -41,8 +46,7 @@ if is_torch_available():
     import torch
 
     from transformers import (
-        AutoModelForCausalLM,
-        AutoTokenizer,
+        AutoProcessor,
         BitsAndBytesConfig,
         GenerationConfig,
         PreTrainedModel,
@@ -65,6 +69,7 @@ if serve_dependencies_available:
     )
     from openai.types.chat.completion_create_params import CompletionCreateParamsStreaming
     from openai.types.responses import (
+        EasyInputMessageParam,
         Response,
         ResponseCompletedEvent,
         ResponseContentPartAddedEvent,
@@ -77,6 +82,7 @@ if serve_dependencies_available:
         ResponseOutputItemAddedEvent,
         ResponseOutputItemDoneEvent,
         ResponseOutputMessage,
+        ResponseOutputMessageParam,
         ResponseOutputText,
         ResponseTextDeltaEvent,
         ResponseTextDoneEvent,
@@ -91,6 +97,7 @@ if serve_dependencies_available:
         """
 
         generation_config: Optional[str]
+        input: Union[str, list[ResponseOutputMessageParam], list[EasyInputMessageParam]]
 
     class TransformersCompletionCreateParamsStreaming(CompletionCreateParamsStreaming, total=False):
         """
@@ -361,7 +368,7 @@ class ServeCommand(BaseTransformersCLICommand):
         self.loaded_model: Optional[str] = None
         self.running_continuous_batching_manager: Optional[ContinuousBatchingManager] = None
         self.model: PreTrainedModel
-        self.tokenizer: PreTrainedTokenizerFast
+        self.processor: PreTrainedTokenizerFast
 
         # 2. preserves information about the last call and last KV cache, to determine whether we can reuse the KV
         # cache and avoid re-running prefil
@@ -529,6 +536,7 @@ class ServeCommand(BaseTransformersCLICommand):
             output = self.generate_response(request)
             return StreamingResponse(output, media_type="text/event-stream")
 
+        @app.options("/v1/models")
         @app.get("/v1/models")
         def get_all_models():
             return JSONResponse(
@@ -567,6 +575,8 @@ class ServeCommand(BaseTransformersCLICommand):
             model_info("meta-llama/Llama-3.1-8B-Instruct"),
             model_info("meta-llama/Llama-3.2-1B-Instruct"),
             model_info("meta-llama/Llama-3.3-70B-Instruct"),
+            model_info("HuggingFaceTB/SmolVLM-Instruct"),
+            model_info("ibm-granite/granite-vision-3.2-2b"),
         ]
 
     def continuous_batching_chat_completion(self, req: dict) -> Generator[str, None, None]:
@@ -593,8 +603,8 @@ class ServeCommand(BaseTransformersCLICommand):
         generation_config = create_generation_config_from_req(
             req,
             model_generation_config=self.model.generation_config,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.processor.eos_token_id,
+            pad_token_id=self.processor.pad_token_id,
             use_cache=False,
             num_blocks=1,
             block_size=1024,
@@ -614,7 +624,7 @@ class ServeCommand(BaseTransformersCLICommand):
             self.running_continuous_batching_manager.start()
 
         # TODO (Joao, Lysandre): this should also work with tool support
-        inputs = self.tokenizer.apply_chat_template(
+        inputs = self.processor.apply_chat_template(
             req["messages"], return_tensors="pt", add_generation_prompt=True
         ).to(self.model.device)
 
@@ -665,9 +675,31 @@ class ServeCommand(BaseTransformersCLICommand):
         if self.args.force_model is not None:
             req["model"] = self.args.force_model
 
+        messages: Iterable[ChatCompletionMessageParam] = req["messages"]
+
+        processor_inputs = []
+        for message in messages:
+            parsed_message = {"role": message["role"], "content": []}
+            if isinstance(message["content"], str):
+                parsed_message["content"].append({"type": "text", "text": message["content"]})
+            else:
+                for content in message["content"]:
+                    if content["type"] == "text":
+                        parsed_message["content"].append(content)
+                    elif content["type"] == "image_url":
+                        image_data = re.sub("^data:image/.+;base64,", "", content["image_url"]["url"])
+                        image = Image.open(BytesIO(base64.b64decode(image_data)))
+
+                        file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                        image.save(file.name)
+
+                        parsed_message["content"].append({"type": "image", "url": file.name})
+
+            processor_inputs.append(parsed_message)
+
         update_model = self.canonicalized_model_name(req["model"]) != self.loaded_model
         if update_model:
-            self.load_model_and_tokenizer(req["model"], self.args)
+            self.load_model_and_processor(req["model"], self.args)
 
         # HACK for tiny-agents: it sends a request after the assistant message (???). Let's assume we can't have a
         # request whose last message is from the assistant.
@@ -685,16 +717,18 @@ class ServeCommand(BaseTransformersCLICommand):
         # 2. force generation to pick from that tool's arguments
         # ====== END OF TOOL PREPROCESSING LOGIC ======
 
-        if tool_model_family is not None:
-            text = self.tokenizer.apply_chat_template(
-                req["messages"], add_generation_prompt=True, tokenize=False, tools=req.get("tools")
-            )
-        else:
-            text = self.tokenizer.apply_chat_template(req["messages"], add_generation_prompt=True, tokenize=False)
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)["input_ids"]
+        inputs = self.processor.apply_chat_template(
+            processor_inputs,
+            add_generation_prompt=True,
+            tools=req.get("tools", None),
+            return_tensors="pt",
+            return_dict=True,
+            tokenize=True,
+        )
+        inputs = inputs.to(self.model.device)
         request_id = req.get("request_id", "req_0")
 
-        generation_streamer = TextIteratorStreamer(self.tokenizer, skip_special_tokens=True, skip_prompt=True)
+        generation_streamer = TextIteratorStreamer(self.processor, skip_special_tokens=True, skip_prompt=True)
         generation_config = create_generation_config_from_req(
             req, model_generation_config=self.model.generation_config
         )
@@ -704,8 +738,7 @@ class ServeCommand(BaseTransformersCLICommand):
             last_kv_cache = self.last_kv_cache
 
         generation_kwargs = {
-            "inputs": inputs,
-            "attention_mask": torch.ones_like(inputs),
+            **inputs,
             "streamer": generation_streamer,
             "generation_config": generation_config,
             "return_dict_in_generate": True,
@@ -825,13 +858,13 @@ class ServeCommand(BaseTransformersCLICommand):
 
         update_model = self.canonicalized_model_name(req["model"]) != self.loaded_model
         if update_model:
-            self.load_model_and_tokenizer(req["model"], self.args)
+            self.load_model_and_processor(req["model"], self.args)
 
-        text = self.tokenizer.apply_chat_template(req["input"], add_generation_prompt=True, tokenize=False)
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)["input_ids"]
+        text = self.processor.apply_chat_template(req["input"], add_generation_prompt=True, tokenize=False)
+        inputs = self.processor(text, return_tensors="pt").to(self.model.device)["input_ids"]
         request_id = req.get("previous_response_id", "req_0")
 
-        generation_streamer = TextIteratorStreamer(self.tokenizer, skip_special_tokens=True, skip_prompt=True)
+        generation_streamer = TextIteratorStreamer(self.processor, skip_special_tokens=True, skip_prompt=True)
         generation_config = create_generation_config_from_req(
             req, model_generation_config=self.model.generation_config
         )
@@ -1123,9 +1156,9 @@ class ServeCommand(BaseTransformersCLICommand):
             return model_id
         return f"{model_id}@main"
 
-    def load_model_and_tokenizer(self, model_id_and_revision: str, args: ServeArguments):
+    def load_model_and_processor(self, model_id_and_revision: str, args: ServeArguments):
         """
-        Loads the model and tokenizer from the given model ID and revision into the ServeCommand instance.
+        Loads the model and processor from the given model ID and revision into the ServeCommand instance.
 
         Args:
             model_id_and_revision (`str`):
@@ -1140,7 +1173,7 @@ class ServeCommand(BaseTransformersCLICommand):
         else:
             model_id, revision = model_id_and_revision, "main"
 
-        tokenizer = AutoTokenizer.from_pretrained(
+        processor = AutoProcessor.from_pretrained(
             model_id,
             revision=revision,
             trust_remote_code=args.trust_remote_code,
@@ -1158,7 +1191,9 @@ class ServeCommand(BaseTransformersCLICommand):
             "trust_remote_code": args.trust_remote_code,
         }
 
-        model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+        config = AutoConfig.from_pretrained(model_id, **model_kwargs)
+        architecture = getattr(transformers, config.architectures[0])
+        model = architecture.from_pretrained(model_id, **model_kwargs)
 
         if model.generation_config.max_new_tokens is not None and model.generation_config.max_new_tokens < 1024:
             model.generation_config.max_new_tokens = 1024
@@ -1170,7 +1205,7 @@ class ServeCommand(BaseTransformersCLICommand):
 
         logger.warning(f"Loaded model {self.loaded_model}")
         self.model = model
-        self.tokenizer = tokenizer
+        self.processor = processor
 
 
 if __name__ == "__main__":
