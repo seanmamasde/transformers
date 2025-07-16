@@ -36,7 +36,14 @@ from transformers.utils.import_utils import (
     is_uvicorn_available,
 )
 
-from .. import AutoConfig, LogitsProcessorList, PreTrainedTokenizerFast, TextIteratorStreamer
+from .. import (
+    AutoConfig,
+    BaseImageProcessor,
+    LogitsProcessorList,
+    PreTrainedTokenizerFast,
+    ProcessorMixin,
+    TextIteratorStreamer,
+)
 from ..generation.continuous_batching import ContinuousBatchingManager, RequestStatus
 from ..utils import is_torch_available, logging
 from . import BaseTransformersCLICommand
@@ -368,7 +375,7 @@ class ServeCommand(BaseTransformersCLICommand):
         self.loaded_model: Optional[str] = None
         self.running_continuous_batching_manager: Optional[ContinuousBatchingManager] = None
         self.model: PreTrainedModel
-        self.processor: PreTrainedTokenizerFast
+        self.processor: PreTrainedTokenizerFast | BaseImageProcessor | ProcessorMixin
 
         # 2. preserves information about the last call and last KV cache, to determine whether we can reuse the KV
         # cache and avoid re-running prefil
@@ -680,8 +687,19 @@ class ServeCommand(BaseTransformersCLICommand):
         processor_inputs = []
         for message in messages:
             parsed_message = {"role": message["role"], "content": []}
+
+            # VLMs work with 'content' as a dictionary -> 'content' holds a 'type' key indicating the type of the
+            # message. This is not the case for all LLMs however, as those only handle text: Qwen2.5's Chat
+            # Template only handles 'content' as a string, for example.
+            elements_are_dicts = any(isinstance(content, str) for content in message["content"])
+
             if isinstance(message["content"], str):
-                parsed_message["content"].append({"type": "text", "text": message["content"]})
+                if elements_are_dicts:
+                    # If other elements are dictionaries, then plain strings should be as well
+                    parsed_message["content"].append({"type": "text", "text": message["content"]})
+                else:
+                    # If no other elements are dicts, then the string is the entire content.
+                    parsed_message["content"] = message["content"]
             else:
                 for content in message["content"]:
                     if content["type"] == "text":
