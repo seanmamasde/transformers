@@ -605,7 +605,7 @@ class ServeCommand(BaseTransformersCLICommand):
             if self.running_continuous_batching_manager is not None:
                 self.running_continuous_batching_manager.stop(block=True, timeout=2)
                 self.running_continuous_batching_manager = None
-            self.load_model_and_tokenizer(req["model"], self.args)
+            self.load_model_and_processor(req["model"], self.args)
 
         generation_config = create_generation_config_from_req(
             req,
